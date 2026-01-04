@@ -35,6 +35,7 @@ while [ $retry_count -lt $MAX_RETRIES ]; do
     # Run syncoid
     if syncoid \
         --no-privilege-elevation \
+        --identifier="nsyncd" \
         --sshport="${REMOTE_PORT}" \
         --sshkey="${SSH_KEY}" \
         --sshcipher="${SSH_CIPHER}" \
@@ -52,8 +53,8 @@ while [ $retry_count -lt $MAX_RETRIES ]; do
         retry_count=$((retry_count + 1))
         
         if [ $retry_count -lt $MAX_RETRIES ]; then
-            echo "${LOG_PREFIX} Waiting 10 seconds before retry..."
-            sleep 10
+            echo "${LOG_PREFIX} Waiting 60 seconds before retry..."
+            sleep 60
         fi
     fi
 done
