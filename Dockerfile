@@ -3,16 +3,16 @@ FROM ubuntu:22.04
 # Avoid interactive prompts during package installation
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Install required packages
+# Install required packages including ZFS utilities
 RUN apt-get update && apt-get install -y \
     sanoid \
+    zfsutils-linux \
     openssh-client \
     mbuffer \
     pv \
     lzop \
     zstd \
     cron \
-    nfs-common \
     sudo \
     && rm -rf /var/lib/apt/lists/*
 
