@@ -1,40 +1,33 @@
-# Syncoid Docker Container
+# nsyncd - ZFS Syncoid Container
 
-Automated ZFS replication from a remote pool to a local NFS-mounted destination using syncoid.
+Automated ZFS-to-ZFS replication from a remote pool to a local pool using syncoid. Designed to run as a Kubernetes CronJob.
 
 ## Features
 
-- Runs syncoid every 15 minutes via cron
+- ZFS-to-ZFS replication via SSH
+- Runs as a one-shot container (suitable for Kubernetes CronJob)
 - SSH key mounted securely as read-only
 - Configurable via environment variables
-- Automatic retry on failure
-- Optional sync on container start
+- Automatic retry on failure (default: 3 attempts)
 - Read-only filesystem compatible
+- Consistent snapshot naming with `--identifier`
 
 ## Quick Start
 
-### Docker Compose
-
-```bash
-docker-compose up -d
-```
-
-### Manual Docker Run
+### Docker
 
 ```bash
 docker build -t nsyncd .
 
-docker run -d \
-  --name nsyncd \
+docker run --rm \
   --privileged \
   -e REMOTE_USER=<SSH_USERNAME> \
   -e REMOTE_HOST=<REMOTE_HOST_IP> \
   -e REMOTE_PORT=<SSH_PORT> \
   -e REMOTE_DATASET=<REMOTE_ZFS_DATASET> \
-  -e LOCAL_DATASET=/nfs-share \
-  -e RUN_ON_START=true \
+  -e LOCAL_DATASET=<LOCAL_ZFS_DATASET> \
   -v /path/to/ssh/key:/root/.ssh/id_rsa:ro \
-  -v /path/to/nfs/mount:/nfs-share \
+  -v /dev/zfs:/dev/zfs \
   nsyncd
 ```
 
@@ -47,136 +40,169 @@ docker run -d \
 | `REMOTE_USER` | - | SSH username for remote host |
 | `REMOTE_HOST` | - | Remote ZFS server IP/hostname |
 | `REMOTE_PORT` | - | SSH port |
-| `REMOTE_DATASET` | - | Remote ZFS dataset to sync |
-| `LOCAL_DATASET` | `/nfs-share` | Local destination path |
+| `REMOTE_DATASET` | - | Remote ZFS dataset to sync (e.g., `tank/media`) |
+| `LOCAL_DATASET` | - | Local ZFS dataset destination (e.g., `tank/media`) |
 | `SSH_KEY` | `/root/.ssh/id_rsa` | Path to SSH key inside container |
 | `SSH_CIPHER` | `chacha20-poly1305@openssh.com` | SSH cipher to use |
 | `MBUFFER_SIZE` | `1G` | mbuffer size for transfers |
 | `MAX_RETRIES` | `3` | Number of retry attempts |
-| `RUN_ON_START` | `false` | Run sync immediately on start |
 
 ### Volume Mounts
 
 | Host Path | Container Path | Description |
 |-----------|----------------|-------------|
 | `/path/to/ssh/key` | `/root/.ssh/id_rsa:ro` | SSH private key (read-only) |
-| `/path/to/nfs/mount` | `/nfs-share` | NFS mount point |
+| `/dev/zfs` | `/dev/zfs` | ZFS device (required for ZFS operations) |
 
-## Kubernetes Deployment
+## Kubernetes CronJob
 
-Kubernetes manifests are provided in the `k8s/` directory.
+Deploy as a Kubernetes CronJob for scheduled syncs.
+
+### Example CronJob
+
+```yaml
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: nsyncd
+  namespace: default
+spec:
+  schedule: "*/15 * * * *"  # Every 15 minutes
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 3
+      template:
+        spec:
+          hostPID: true
+          restartPolicy: OnFailure
+          containers:
+            - name: syncoid
+              image: <REGISTRY>/nsyncd:latest
+              envFrom:
+                - configMapRef:
+                    name: syncoid-config
+              env:
+                - name: REMOTE_HOST
+                  valueFrom:
+                    secretKeyRef:
+                      name: nsyncd-secret
+                      key: REMOTE_HOST
+              volumeMounts:
+                - name: ssh-key
+                  mountPath: /root/.ssh/id_rsa
+                  subPath: id_rsa
+                  readOnly: true
+                - name: dev-zfs
+                  mountPath: /dev/zfs
+              securityContext:
+                privileged: true
+          volumes:
+            - name: ssh-key
+              secret:
+                secretName: nsyncd-secret
+                defaultMode: 0600
+            - name: dev-zfs
+              hostPath:
+                path: /dev/zfs
+                type: CharDevice
+```
+
+### Example ConfigMap
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: syncoid-config
+  namespace: default
+data:
+  REMOTE_USER: "<SSH_USERNAME>"
+  REMOTE_PORT: "<SSH_PORT>"
+  REMOTE_DATASET: "<REMOTE_ZFS_DATASET>"
+  LOCAL_DATASET: "<LOCAL_ZFS_DATASET>"
+  SSH_KEY: "/root/.ssh/id_rsa"
+  SSH_CIPHER: "chacha20-poly1305@openssh.com"
+  MBUFFER_SIZE: "1G"
+  MAX_RETRIES: "3"
+```
 
 ### Prerequisites
 
-- NFS CSI driver or static PV/PVC for NFS mount
-- External Secrets Operator (for secret management)
-- ClusterSecretStore configured
+- Node with ZFS installed and pool imported
+- Privileged namespace (Pod Security Admission)
+- External Secrets Operator (optional, for secret management)
 
 ### Deploy
 
-1. **Update configuration** in `k8s/configmap.yaml`:
-   ```yaml
-   REMOTE_USER: "<SSH_USERNAME>"
-   REMOTE_PORT: "<SSH_PORT>"
-   REMOTE_DATASET: "<REMOTE_ZFS_DATASET>"
-   ```
+```bash
+kubectl apply -f cronjob.yaml
+kubectl apply -f configmap.yaml
+```
 
-2. **Update external secret** in `k8s/external-secret.yaml` with your secret store paths
+### Trigger Manual Sync
 
-3. **Update NFS PV** in `k8s/pv-pvc.yaml`:
-   ```yaml
-   nfs:
-     server: <NFS_SERVER_IP>
-     path: <NFS_EXPORT_PATH>
-   ```
-
-4. **Build and push image**:
-   ```bash
-   docker build -t <REGISTRY>/nsyncd:latest .
-   docker push <REGISTRY>/nsyncd:latest
-   ```
-
-5. **Deploy**:
-   ```bash
-   kubectl apply -k k8s/
-   ```
+```bash
+kubectl create job --from=cronjob/nsyncd nsyncd-manual -n default
+```
 
 ## Logs
 
-View sync logs:
-
 ```bash
-# Docker
-docker logs -f nsyncd
+# View latest job logs
+kubectl logs -l app=nsyncd -n default --tail=100
 
-# Kubernetes
-kubectl logs -f deployment/nsyncd -n <NAMESPACE>
+# Follow a specific job
+kubectl logs job/nsyncd-manual -n default -f
 ```
 
 ## Customizing the Schedule
 
-To change the sync interval, modify the cron expression in the Dockerfile:
+Modify the `schedule` field in the CronJob:
 
-```dockerfile
-# Current: every 15 minutes
-RUN echo "*/15 * * * * /usr/local/bin/sync.sh > /proc/1/fd/1 2>/proc/1/fd/2" > /etc/cron.d/syncoid-cron
-
-# Example: every hour
-RUN echo "0 * * * * /usr/local/bin/sync.sh > /proc/1/fd/1 2>/proc/1/fd/2" > /etc/cron.d/syncoid-cron
-
-# Example: every 30 minutes
-RUN echo "*/30 * * * * /usr/local/bin/sync.sh > /proc/1/fd/1 2>/proc/1/fd/2" > /etc/cron.d/syncoid-cron
+```yaml
+schedule: "*/15 * * * *"  # Every 15 minutes
+schedule: "0 * * * *"     # Every hour
+schedule: "0 */6 * * *"   # Every 6 hours
+schedule: "0 0 * * *"     # Daily at midnight
 ```
 
 ## Troubleshooting
 
 ### SSH Connection Issues
 
-1. Ensure the SSH key has correct permissions:
-   ```bash
-   chmod 600 /path/to/ssh/key
-   ```
+```bash
+# Test from a running job pod
+kubectl exec -it job/nsyncd-manual -n default -- \
+  ssh -i /root/.ssh/id_rsa -p <SSH_PORT> <SSH_USERNAME>@<REMOTE_HOST_IP>
+```
 
-2. Test SSH connection manually:
-   ```bash
-   # Docker
-   docker exec -it nsyncd ssh -i /root/.ssh/id_rsa -p <SSH_PORT> <SSH_USERNAME>@<REMOTE_HOST_IP>
-   
-   # Kubernetes
-   kubectl exec -it deployment/nsyncd -n <NAMESPACE> -- ssh -i /root/.ssh/id_rsa -p <SSH_PORT> <SSH_USERNAME>@<REMOTE_HOST_IP>
-   ```
-
-### NFS Mount Issues
-
-1. Ensure NFS utilities are available and the share is accessible
-2. For Docker: Check if the host has the NFS share mounted before starting the container
-3. For Kubernetes: Verify the PV/PVC is bound and the NFS server is reachable
-
-### Manual Sync
-
-Trigger a sync manually:
+### ZFS Issues
 
 ```bash
-# Docker
-docker exec nsyncd /usr/local/bin/sync.sh
-
-# Kubernetes
-kubectl exec deployment/nsyncd -n <NAMESPACE> -- /usr/local/bin/sync.sh
+# Check ZFS is accessible in pod
+kubectl exec -it job/nsyncd-manual -n default -- zpool list
+kubectl exec -it job/nsyncd-manual -n default -- zfs list
 ```
+
+### Common Errors
+
+| Error | Cause | Solution |
+|-------|-------|----------|
+| `failed to initialize ZFS library` | `/dev/zfs` not mounted | Add hostPath volume for `/dev/zfs` |
+| `No such pool` | ZFS pool not imported on node | Import pool on the node |
+| `No matching snapshots` | No common snapshot between source/destination | See "Initial Sync" section |
+
+### Initial Sync
+
+For the first sync, syncoid needs a common snapshot on both sides. If syncing to an existing dataset, ensure at least one snapshot exists on both with matching GUIDs (created via `zfs send/receive`, not independently).
 
 ## File Structure
 
 ```
-├── Dockerfile              # Container image definition
-├── docker-compose.yml      # Docker Compose configuration
-├── sync.sh                 # Syncoid sync script
-├── entrypoint.sh           # Container entrypoint
-├── README.md               # This file
-└── k8s/
-    ├── kustomization.yaml  # Kustomize configuration
-    ├── namespace.yaml      # Namespace definition
-    ├── configmap.yaml      # Environment configuration
-    ├── external-secret.yaml# ExternalSecret for SSH key & secrets
-    ├── pv-pvc.yaml         # NFS PersistentVolume/Claim
-    └── deployment.yaml     # Deployment specification
+├── Dockerfile    # Container image definition
+├── sync.sh       # Syncoid sync script
+└── README.md     # This file
 ```
